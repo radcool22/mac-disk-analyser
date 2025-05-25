@@ -6,12 +6,12 @@ import subprocess
 import datetime
 import sys
 import collections
+import json
+import openai
+from dotenv import load_dotenv # For securely loading API key
 
 # --- Configuration ---
 # Directories to scan for overall size analysis.
-# These should generally be user-accessible.
-# Adding /Library directly might require sudo for full access, which is not recommended
-# for a purely analytical script.
 SCAN_DIRS_FOR_SIZE = [
     os.path.expanduser('~'),  # Your home directory
     '/Library/Caches',
@@ -20,14 +20,11 @@ SCAN_DIRS_FOR_SIZE = [
 ]
 
 # Directories to specifically scan for large/old/cache/temp files.
-# These are usually places where large unnecessary files accumulate.
 SCAN_DIRS_FOR_SUGGESTIONS = [
     os.path.expanduser('~'),
     '/Library/Caches',
     '/private/var/folders',
     '/tmp',
-    # Consider adding other common locations like /Applications if you want to see large apps,
-    # but be mindful of permissions and relevance.
 ]
 
 # Files larger than this (in MB) will be flagged as "large".
@@ -37,23 +34,30 @@ MIN_LARGE_FILE_SIZE_MB = 100
 OLD_FILE_DAYS = 90
 
 # Keywords/patterns to identify potential cache, temp, or log files.
-# These are case-insensitive.
 CACHE_PATTERNS = ['cache', '.cache', 'chromium', 'vscode', 'npm', 'yarn', 'brew', 'library/developer/xcode/deriveddata']
 TEMP_PATTERNS = ['temp', '.tmp', 'temporary', 'downloads', 'trash', '.Trash']
 LOG_PATTERNS = ['log', '.log', 'logs']
 
-# Number of top directories to display
-TOP_N_DIRS = 15
+# Number of top directories to display by default (can be overridden by agent)
+DEFAULT_TOP_N_DIRS = 15
 
-# --- Helper Functions ---
+# --- Global Data Storage (Populated by initial scan) ---
+_disk_summary_data = {}
+_directory_sizes_data = [] # List of (path, size_bytes) tuples
+_suggested_files_data = collections.defaultdict(list) # Dict of {suggestion_type: [(filepath, size)]}
+
+# --- Helper Functions (from previous script, adapted to return data) ---
 
 def convert_bytes_to_human_readable(num_bytes):
     """Converts a number of bytes into a human-readable string (e.g., 10GB, 500MB)."""
+    if num_bytes is None:
+        return "N/A"
+    num_bytes = float(num_bytes)
     for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB']:
         if num_bytes < 1024.0:
             return f"{num_bytes:.2f} {unit}"
         num_bytes /= 1024.0
-    return f"{num_bytes:.2f} PB" # Fallback for extremely large sizes
+    return f"{num_bytes:.2f} PB"
 
 def convert_human_readable_to_bytes(size_str):
     """Converts a human-readable size string (e.g., '1.2G', '500M') to bytes."""
@@ -61,20 +65,31 @@ def convert_human_readable_to_bytes(size_str):
     if not size_str:
         return 0
 
-    num = float("".join(filter(str.isdigit, size_str)))
-    unit = "".join(filter(str.isalpha, size_str))
+    # Extract number part
+    num_str = ""
+    unit_str = ""
+    for char in size_str:
+        if char.isdigit() or char == '.':
+            num_str += char
+        else:
+            unit_str += char
 
-    if 'K' in unit:
+    try:
+        num = float(num_str)
+    except ValueError:
+        return 0 # Cannot parse number
+
+    if 'K' in unit_str:
         return num * 1024
-    elif 'M' in unit:
+    elif 'M' in unit_str:
         return num * 1024**2
-    elif 'G' in unit:
+    elif 'G' in unit_str:
         return num * 1024**3
-    elif 'T' in unit:
+    elif 'T' in unit_str:
         return num * 1024**4
-    elif 'P' in unit:
+    elif 'P' in unit_str:
         return num * 1024**5
-    elif 'B' in unit:
+    elif 'B' in unit_str: # Explicit bytes or no unit
         return num
     return num # Default to bytes if no unit found
 
@@ -86,7 +101,7 @@ def is_old_file(filepath, days_threshold):
         file_age_days = file_age_seconds / (24 * 3600)
         return file_age_days > days_threshold
     except (OSError, FileNotFoundError):
-        return False # Cannot determine age
+        return False
 
 def classify_file(filepath):
     """Classifies a file based on its path for suggestion purposes."""
@@ -99,100 +114,80 @@ def classify_file(filepath):
         return "Log"
     return "Other"
 
-# --- Main Scan Functions ---
+# --- Data Collection Functions (Populate global data) ---
 
-def get_disk_summary():
-    """Gets overall disk usage for the root partition."""
+def run_initial_scan():
+    """Performs the initial disk scan and populates global data."""
+    print("--- Initial Disk Scan ---")
+    print("This may take a few moments depending on your disk size and speed.")
+    print("Scanning...")
+
+    # 1. Get Disk Summary
     try:
         total, used, free = shutil.disk_usage("/")
-        print("\n--- Disk Usage Summary (Root Partition) ---")
-        print(f"Total: {convert_bytes_to_human_readable(total)}")
-        print(f"Used:  {convert_bytes_to_human_readable(used)}")
-        print(f"Free:  {convert_bytes_to_human_readable(free)}")
-        print(f"Usage: {used / total:.2%}")
+        _disk_summary_data.update({
+            "total": total,
+            "used": used,
+            "free": free,
+            "usage_percentage": used / total if total > 0 else 0
+        })
+        print(f"  Disk Summary Collected: Used {convert_bytes_to_human_readable(used)}")
     except Exception as e:
-        print(f"Error getting disk summary: {e}")
+        print(f"  Error getting disk summary: {e}")
+        _disk_summary_data.clear()
 
-def get_directory_sizes(paths):
-    """
-    Uses 'du -sh' to get human-readable sizes of specified directories.
-    Returns a dictionary of {path: size_in_bytes}.
-    """
-    print("\n--- Top Directory Sizes ---")
-    print(f"Scanning directories: {', '.join(paths)}")
+    # 2. Get Top Directory Sizes
+    print(f"  Scanning top-level directories: {', '.join(SCAN_DIRS_FOR_SIZE)}")
     dir_sizes = {}
-    for path in paths:
+    for path in SCAN_DIRS_FOR_SIZE:
         if not os.path.exists(path):
-            print(f"Warning: Directory not found: {path}. Skipping.")
+            print(f"    Warning: Directory not found: {path}. Skipping.")
             continue
         try:
-            # -s: summarize (only total for each argument)
-            # -h: human-readable (not ideal for parsing, but we'll convert)
-            # -k: block size of 1024 bytes (optional, but consistent if parsing numbers directly)
-            # -d 0: only show size of the top-level directory itself, not sub-directories
             process = subprocess.run(
                 ['du', '-sh', path],
                 capture_output=True,
                 text=True,
-                check=True
+                check=True,
+                encoding='utf-8' # Ensure correct encoding for file paths
             )
             output = process.stdout.strip().split('\t')
             if len(output) == 2:
                 size_str, dir_path = output
                 dir_sizes[dir_path] = convert_human_readable_to_bytes(size_str)
             else:
-                print(f"Warning: Could not parse du output for {path}: {output}")
+                print(f"    Warning: Could not parse du output for {path}: {output}")
         except subprocess.CalledProcessError as e:
-            print(f"Error running 'du' for {path}: {e.stderr.strip()}")
+            print(f"    Error running 'du' for {path}: {e.stderr.strip()}")
         except Exception as e:
-            print(f"An unexpected error occurred for {path}: {e}")
+            print(f"    An unexpected error occurred for {path}: {e}")
 
-    # Sort directories by size
-    sorted_dir_sizes = sorted(dir_sizes.items(), key=lambda item: item[1], reverse=True)
+    _directory_sizes_data.extend(sorted(dir_sizes.items(), key=lambda item: item[1], reverse=True))
+    print(f"  Top Directory Sizes Collected ({len(_directory_sizes_data)} entries).")
 
-    print(f"\nTop {TOP_N_DIRS} largest directories in specified scan paths:")
-    for i, (path, size) in enumerate(sorted_dir_sizes[:TOP_N_DIRS]):
-        print(f"  {convert_bytes_to_human_readable(size):<10} {path}")
-
-def find_large_and_old_files_for_suggestions(directories):
-    """
-    Scans specified directories for large, old, or classified files.
-    """
-    print(f"\n--- Potential Cleanup Suggestions ---")
-    print(f"Looking for files > {MIN_LARGE_FILE_SIZE_MB}MB or older than {OLD_FILE_DAYS} days in:")
-    for d in directories:
-        print(f"  - {d}")
-
-    suggestions = collections.defaultdict(list)
+    # 3. Find Large/Old/Cache/Temp Files for Suggestions
+    print(f"  Scanning for potential cleanup suggestions in: {', '.join(SCAN_DIRS_FOR_SUGGESTIONS)}")
     min_size_bytes = MIN_LARGE_FILE_SIZE_MB * 1024 * 1024
 
-    for directory in directories:
+    for directory in SCAN_DIRS_FOR_SUGGESTIONS:
         if not os.path.exists(directory):
-            print(f"Warning: Suggestion scan directory not found: {directory}. Skipping.")
+            print(f"    Warning: Suggestion scan directory not found: {directory}. Skipping.")
             continue
-        print(f"Scanning {directory}...")
-        for root, dirs, files in os.walk(directory):
+        # print(f"    Scanning {directory}...")
+        for root, dirs, files in os.walk(directory, followlinks=False): # Don't follow symlinks to avoid loops and double counting
             # Prune directories that are likely permission-denied or irrelevant for this scan
-            dirs[:] = [d for d in dirs if not d.startswith('.')] # Skip hidden system folders
+            dirs[:] = [d for d in dirs if not d.startswith(('.', '$')) and d != 'tmp'] # Skip hidden system folders, Windows tmp, etc.
             if 'Library/Containers' in root and os.path.expanduser('~') in root:
                 # Many app sandboxes are in here, often restricted or not relevant for manual cleanup
                 # unless specifically targeting an app's data. Prune deep dives.
-                # However, /Library/Caches is explicitly scanned.
                 if 'Containers' in dirs: dirs.remove('Containers')
+            if '.Trash' in dirs: dirs.remove('.Trash') # handled by specific patterns
 
 
             for name in files:
                 filepath = os.path.join(root, name)
                 try:
-                    # Resolve symbolic links to get actual file size
-                    # and avoid double counting or following broken links
-                    if os.path.islink(filepath):
-                        actual_path = os.path.realpath(filepath)
-                        if not os.path.exists(actual_path):
-                            continue # Broken link
-                        file_size = os.path.getsize(actual_path)
-                    else:
-                        file_size = os.path.getsize(filepath)
+                    file_size = os.path.getsize(filepath)
 
                     is_large = file_size >= min_size_bytes
                     is_old = is_old_file(filepath, OLD_FILE_DAYS)
@@ -208,78 +203,354 @@ def find_large_and_old_files_for_suggestions(directories):
                             suggestion_type.append(file_type)
 
                         if suggestion_type:
-                            suggestions[tuple(sorted(suggestion_type))].append((filepath, file_size))
+                            _suggested_files_data[tuple(sorted(suggestion_type))].append({"path": filepath, "size": file_size})
 
                 except PermissionError:
-                    # print(f"Permission denied: {filepath}")
                     pass # Silently skip permission errors for individual files
                 except FileNotFoundError:
                     pass # File might have been deleted between os.walk and os.path.getsize
+                except OSError as e: # Catch other OS-related errors like invalid file names
+                    # print(f"    OS Error processing {filepath}: {e}")
+                    pass
                 except Exception as e:
-                    # print(f"Error processing {filepath}: {e}")
-                    pass # Catch other unexpected errors
+                    # print(f"    Error processing {filepath}: {e}")
+                    pass
 
-    if not suggestions:
-        print("No specific cleanup suggestions found based on current criteria.")
-        return
+    print(f"  Cleanup Suggestions Collected ({sum(len(v) for v in _suggested_files_data.values())} potential files).")
+    print("Initial scan complete. You can now ask questions.")
 
-    # Sort and display suggestions
-    print("\n--- Suggested Files/Directories for Review ---")
-    print("  (No files will be deleted by this script. Review manually.)")
-    print("  ----------------------------------------------------------")
+# --- LLM Tools (Functions the AI agent can call) ---
 
-    # Order by combined type for better readability
-    ordered_suggestion_types = [
-        ('Large', 'Old', 'Temporary'),
-        ('Large', 'Temporary'),
-        ('Old', 'Temporary'),
-        ('Temporary',),
-        ('Large', 'Old', 'Cache'),
-        ('Large', 'Cache'),
-        ('Old', 'Cache'),
-        ('Cache',),
-        ('Large', 'Old'),
-        ('Large',),
-        ('Old',),
+def get_overall_disk_info():
+    """
+    Returns the overall disk usage information for the root partition,
+    including total, used, free space, and usage percentage.
+    """
+    if not _disk_summary_data:
+        return "Disk summary data not available."
+    return json.dumps({
+        "total": convert_bytes_to_human_readable(_disk_summary_data.get("total")),
+        "used": convert_bytes_to_human_readable(_disk_summary_data.get("used")),
+        "free": convert_bytes_to_human_readable(_disk_summary_data.get("free")),
+        "usage_percentage": f"{_disk_summary_data.get('usage_percentage', 0):.2%}"
+    })
+
+def get_top_n_directories(n: int = DEFAULT_TOP_N_DIRS):
+    """
+    Get a list of the largest directories and their sizes.
+    Args:
+        n (int): The number of top directories to return. Defaults to 15.
+    Returns:
+        A JSON string of a list of dictionaries, each with 'path' and 'size'.
+    """
+    if not _directory_sizes_data:
+        return "No directory size data available. Please ensure the initial scan completed successfully."
+    top_dirs = [{"path": path, "size": convert_bytes_to_human_readable(size)}
+                for path, size in _directory_sizes_data[:n]]
+    return json.dumps(top_dirs)
+
+def get_suggested_files(suggestion_type: str = None, limit: int = 10):
+    """
+    Get a list of suggested files for review, optionally filtered by type.
+    Types can be 'Large', 'Old', 'Cache', 'Temporary', 'Log'.
+    You can combine types (e.g., 'Large, Old', 'Cache, Temporary').
+    If no type is specified, returns a summary of all types.
+
+    Args:
+        suggestion_type (str, optional): A comma-separated string of types to filter by.
+                                         Example: "Large, Cache". Case-insensitive.
+                                         Defaults to None (returns summary).
+        limit (int): The maximum number of files to return per category. Defaults to 10.
+    Returns:
+        A JSON string containing the suggestions.
+    """
+    if not _suggested_files_data:
+        return "No specific cleanup suggestions found based on current criteria."
+
+    results = {}
+    requested_types = []
+    if suggestion_type:
+        requested_types = [s.strip().capitalize() for s in suggestion_type.split(',')]
+
+    all_sorted_types = sorted(list(_suggested_files_data.keys()), key=lambda x: len(x), reverse=True)
+
+    for s_type_tuple in all_sorted_types:
+        s_type_name = " ".join(s_type_tuple)
+        if requested_types and not any(rt in s_type_name for rt in requested_types):
+            continue
+
+        items = sorted(_suggested_files_data[s_type_tuple], key=lambda x: x['size'], reverse=True)
+        formatted_items = []
+        for item in items[:limit]:
+            formatted_items.append({
+                "path": item['path'],
+                "size": convert_bytes_to_human_readable(item['size'])
+            })
+        results[s_type_name] = formatted_items
+
+    if not results and requested_types:
+        return f"No suggestions found for types: {suggestion_type}. Available types: {', '.join(set(t for types in _suggested_files_data.keys() for t in types))}"
+    elif not results:
+         return "No specific cleanup suggestions found based on current criteria."
+
+    # If no specific type was requested, provide a summary
+    if not requested_types:
+        summary = {
+            "summary": {
+                "total_suggestions": sum(len(v) for v in _suggested_files_data.values()),
+                "categories_found": {
+                    " ".join(k): len(v) for k, v in _suggested_files_data.items()
+                }
+            },
+            "details_hint": "You can ask for specific categories like 'Large', 'Old', 'Cache', 'Temporary', 'Log', or combinations like 'Large, Old'."
+        }
+        return json.dumps(summary, indent=2)
+
+    return json.dumps(results, indent=2)
+
+
+def search_paths(query: str):
+    """
+    Search for directories or files containing a specific keyword in their path.
+    Args:
+        query (str): The keyword to search for in paths.
+    Returns:
+        A JSON string of a list of paths found.
+    """
+    query_lower = query.lower()
+    found_paths = set()
+
+    for path, _ in _directory_sizes_data:
+        if query_lower in path.lower():
+            found_paths.add(path)
+
+    for s_type_tuple in _suggested_files_data:
+        for item in _suggested_files_data[s_type_tuple]:
+            if query_lower in item['path'].lower():
+                found_paths.add(item['path'])
+
+    if not found_paths:
+        return f"No paths found containing '{query}' in scan results."
+    return json.dumps(list(found_paths)[:20]) # Limit to 20 to avoid overwhelming
+
+# --- LLM Tool Definitions for OpenAI API ---
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_overall_disk_info",
+            "description": "Returns the overall disk usage information for the root partition, including total, used, free space, and usage percentage.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_top_n_directories",
+            "description": "Get a list of the largest directories and their sizes. Use this to find out where most data is stored.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "n": {
+                        "type": "integer",
+                        "description": "The number of top directories to return. Defaults to 15 if not specified."
+                    }
+                },
+                "required": [] # n is optional
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_suggested_files",
+            "description": "Get a list of suggested files for review, filtered by type (e.g., 'Large', 'Old', 'Cache', 'Temporary', 'Log'). This function identifies files that might be good candidates for cleanup. If no type is specified, it provides a summary of all suggestion categories.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "suggestion_type": {
+                        "type": "string",
+                        "description": "A comma-separated string of types to filter by. Example: 'Large, Cache'. Case-insensitive. Leave empty for a general summary."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "The maximum number of files to return per category. Defaults to 10."
+                    }
+                },
+                "required": [] # suggestion_type and limit are optional
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_paths",
+            "description": "Search for directories or files containing a specific keyword in their path. Useful for finding data related to a specific application or type (e.g., 'Xcode', 'photos', 'downloads').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The keyword to search for in paths (case-insensitive)."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
+
+# Map tool names to actual Python functions
+AVAILABLE_FUNCTIONS = {
+    "get_overall_disk_info": get_overall_disk_info,
+    "get_top_n_directories": get_top_n_directories,
+    "get_suggested_files": get_suggested_files,
+    "search_paths": search_paths,
+}
+
+# --- Main Agent Logic ---
+
+def run_conversation():
+    # Load API key from environment variable or .env file
+    load_dotenv()
+    api_key = os.getenv("OPENAI_API_KEY")
+
+    if not api_key:
+        print("\n--- OpenAI API Key Setup ---")
+        print("You need to set your OpenAI API key to use the AI assistant.")
+        print("1. Visit https://platform.openai.com/account/api-keys to get your key.")
+        print("2. You can set it as an environment variable (OPENAI_API_KEY) or")
+        print("   enter it here directly. For security, environment variable is preferred.")
+        api_key = input("Enter your OpenAI API Key (or press Enter to try environment variable): ").strip()
+        if not api_key:
+            api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            print("Error: OpenAI API key not found. Please set it as an environment variable (OPENAI_API_KEY)")
+            print("or provide it when prompted. Exiting.")
+            sys.exit(1)
+
+    openai.api_key = api_key
+
+    client = openai.OpenAI(api_key=api_key)
+
+    messages = [
+        {"role": "system", "content": (
+            "You are a helpful and informative MacBook Disk Usage Assistant. "
+            "Your goal is to answer questions about disk usage and file sizes based on the provided scan data. "
+            "You have access to specific tools to retrieve this data. "
+            "**Crucially, you cannot delete, modify, or create any files or directories.** "
+            "Only provide information and suggestions for manual review. "
+            "When presenting data, use clear and structured formats, like bullet points or tables. "
+            "Always state that you cannot delete or modify files when making suggestions."
+        )}
     ]
 
-    displayed_count = 0
-    MAX_SUGGESTIONS_PER_CATEGORY = 10 # Limit output to prevent overwhelming the user
+    print("\n--- MacBook Disk Usage AI Agent ---")
+    print("Welcome! I've completed the initial disk scan.")
+    print("You can now ask me questions about your disk usage.")
+    print("Examples:")
+    print("  - How much disk space is used?")
+    print("  - What are the largest directories?")
+    print("  - Show me files that are large and old.")
+    print("  - Are there any temporary files I can review?")
+    print("  - Where is Xcode's derived data?")
+    print("Type 'q' or 'exit' to quit.")
 
-    for s_type_tuple in ordered_suggestion_types:
-        s_type_name = " ".join(s_type_tuple)
-        if s_type_tuple in suggestions:
-            items = sorted(suggestions[s_type_tuple], key=lambda x: x[1], reverse=True)
-            print(f"\n{s_type_name} Files/Folders:")
-            for filepath, size in items[:MAX_SUGGESTIONS_PER_CATEGORY]:
-                print(f"  {convert_bytes_to_human_readable(size):<10} {filepath}")
-                displayed_count += 1
-            if len(items) > MAX_SUGGESTIONS_PER_CATEGORY:
-                print(f"  ... and {len(items) - MAX_SUGGESTIONS_PER_CATEGORY} more {s_type_name.lower()} files.")
+    while True:
+        user_query = input("\nYour question: ").strip()
+        if user_query.lower() in ['q', 'quit', 'exit']:
+            print("Exiting Disk Usage Agent. Goodbye!")
+            break
 
-    if displayed_count == 0:
-        print("No specific cleanup suggestions found based on current criteria.")
+        messages.append({"role": "user", "content": user_query})
+
+        try:
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo-0125", # You can try "gpt-4" or other models if available
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto", # Let the model decide whether to call a tool
+            )
+            response_message = response.choices[0].message
+            tool_calls = response_message.tool_calls
+
+            # Step 2: check if the model wanted to call a tool
+            if tool_calls:
+                # print(f"DEBUG: Model requested tool calls: {tool_calls}") # For debugging
+                messages.append(response_message)  # extend conversation with assistant's reply
+                
+                # Step 3: call the tool
+                for tool_call in tool_calls:
+                    function_name = tool_call.function.name
+                    function_to_call = AVAILABLE_FUNCTIONS.get(function_name)
+                    if function_to_call:
+                        try:
+                            function_args = json.loads(tool_call.function.arguments)
+                            function_response = function_to_call(**function_args)
+                            messages.append(
+                                {
+                                    "tool_call_id": tool_call.id,
+                                    "role": "tool",
+                                    "name": function_name,
+                                    "content": function_response,
+                                }
+                            )
+                        except json.JSONDecodeError:
+                            error_message = f"Error: Failed to parse arguments for {function_name}. Args: {tool_call.function.arguments}"
+                            print(f"Agent Error: {error_message}")
+                            messages.append({"role": "tool", "name": function_name, "content": error_message})
+                        except Exception as e:
+                            error_message = f"Error executing tool '{function_name}': {e}"
+                            print(f"Agent Error: {error_message}")
+                            messages.append({"role": "tool", "name": function_name, "content": error_message})
+                    else:
+                        error_message = f"Error: Tool '{function_name}' not found."
+                        print(f"Agent Error: {error_message}")
+                        messages.append({"role": "tool", "name": function_name, "content": error_message})
+
+                # Step 4: send the info back to the model
+                second_response = client.chat.completions.create(
+                    model="gpt-3.5-turbo-0125",
+                    messages=messages,
+                )  # get a new response from the model that can summarize the tool's output
+                print(second_response.choices[0].message.content)
+                messages.append(second_response.choices[0].message) # Add agent's response to history
+
+            else:
+                print(response_message.content)
+                messages.append(response_message) # Add agent's response to history
+
+        except openai.AuthenticationError:
+            print("\nError: Invalid OpenAI API key. Please check your key.")
+            print("Exiting.")
+            sys.exit(1)
+        except openai.APITimeoutError:
+            print("\nError: OpenAI API request timed out. Please try again.")
+        except openai.APIConnectionError as e:
+            print(f"\nError: Could not connect to OpenAI API: {e}")
+        except openai.RateLimitError:
+            print("\nError: OpenAI API rate limit exceeded. Please wait a moment and try again.")
+        except Exception as e:
+            print(f"\nAn unexpected error occurred with the AI agent: {e}")
+            print("Please try again or restart the script.")
 
 
 # --- Main Execution ---
 
-def main():
-    print("MacBook Disk Usage Analyzer")
-    print("----------------------------")
+if __name__ == "__main__":
+    print("Starting MacBook Disk Usage AI Agent...")
+    print("---------------------------------------")
     print("NOTE: This script ONLY analyzes and suggests. It DOES NOT delete or modify any files.")
     print("Permissions: For full system scans, you might need 'sudo'. However, it's safer to run")
     print("             without 'sudo' to avoid scanning system-critical directories, which are")
     print("             usually not the source of user-related disk space issues.")
+    print("Data freshness: All data is based on the initial scan. Restart the script for fresh data.")
 
-    get_disk_summary()
-    get_directory_sizes(SCAN_DIRS_FOR_SIZE)
-    find_large_and_old_files_for_suggestions(SCAN_DIRS_FOR_SUGGESTIONS)
 
-    print("\nAnalysis Complete!")
-    print("-------------------")
-    print("Suggestions are for your review. Always be careful when deleting files.")
-    print("Common locations for manual cleanup might include: Downloads folder, old application installers (.dmg),")
-    print("old Xcode Derived Data, Docker images, large virtual machine files, etc.")
-
-if __name__ == "__main__":
-    main()
+    run_initial_scan()
+    run_conversation()
